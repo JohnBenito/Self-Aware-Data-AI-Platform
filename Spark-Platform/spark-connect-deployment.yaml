@@ -1,0 +1,261 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark-platform
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spark
+  namespace: spark-platform
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spark-role
+  namespace: spark-platform
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/status", "services", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spark-rolebinding
+  namespace: spark-platform
+subjects:
+  - kind: ServiceAccount
+    name: spark
+    namespace: spark-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spark-role
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spark-connect-secrets
+  namespace: spark-platform
+type: Opaque
+stringData:
+  POLARIS_WAREHOUSE: "polaris-warehouse-name"
+  POLARIS_CLIENT_ID: "polaris-client-id"
+  POLARIS_CLIENT_SECRET: "polaris-secret"
+  MINIO_ACCESS_KEY: "minio-user-name"
+  MINIO_SECRET_KEY: "minio-secret-key"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-connect-driver
+  namespace: spark-platform
+spec:
+  clusterIP: None
+  selector:
+    app: spark-connect
+  ports:
+    - name: driver-rpc
+      port: 7078
+      targetPort: 7078
+    - name: blockmanager
+      port: 7079
+      targetPort: 7079
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-connect
+  namespace: spark-platform
+spec:
+  selector:
+    app: spark-connect
+  ports:
+    - name: grpc
+      port: 15002
+      targetPort: 15002
+    - name: ui
+      port: 4040
+      targetPort: 4040
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-connect
+  namespace: spark-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-connect
+  template:
+    metadata:
+      labels:
+        app: spark-connect
+    spec:
+      serviceAccountName: spark
+      containers:
+        - name: spark-connect
+          image: apache/spark:4.0.2-scala2.13-java17-python3-ubuntu
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POLARIS_WAREHOUSE
+              valueFrom:
+                secretKeyRef:
+                  name: spark-connect-secrets
+                  key: POLARIS_WAREHOUSE
+            - name: POLARIS_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: spark-connect-secrets
+                  key: POLARIS_CLIENT_ID
+            - name: POLARIS_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: spark-connect-secrets
+                  key: POLARIS_CLIENT_SECRET
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spark-connect-secrets
+                  key: MINIO_ACCESS_KEY
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spark-connect-secrets
+                  key: MINIO_SECRET_KEY
+            - name: SPARK_NO_DAEMONIZE
+              value: "true"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: 15002
+              name: grpc
+            - containerPort: 7078
+              name: driver-rpc
+            - containerPort: 7079
+              name: blockmanager
+            - containerPort: 4040
+              name: webui
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - |
+              set -euo pipefail
+
+              mkdir -p /opt/spark/jars-extra
+
+              if [ ! -f /opt/spark/jars-extra/iceberg-spark-runtime-4.0_2.13-1.10.1.jar ]; then
+                curl -L -o /opt/spark/jars-extra/iceberg-spark-runtime-4.0_2.13-1.10.1.jar \
+                  https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.0_2.13/1.10.1/iceberg-spark-runtime-4.0_2.13-1.10.1.jar
+              fi
+
+              if [ ! -f /opt/spark/jars-extra/iceberg-aws-bundle-1.10.1.jar ]; then
+                curl -L -o /opt/spark/jars-extra/iceberg-aws-bundle-1.10.1.jar \
+                  https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.10.1/iceberg-aws-bundle-1.10.1.jar
+              fi
+
+              export SPARK_EXTRA_CLASSPATH="/opt/spark/jars-extra/*"
+
+              /opt/spark/sbin/start-connect-server.sh \
+                --conf spark.master=k8s://https://kubernetes.default.svc \
+                --conf spark.submit.deployMode=client \
+                --conf spark.kubernetes.namespace=spark-platform \
+                --conf spark.kubernetes.container.image=apache/spark:4.0.2-scala2.13-java17-python3-ubuntu \
+                --conf spark.kubernetes.authenticate.serviceAccountName=spark \
+                --conf spark.kubernetes.driver.pod.name=${POD_NAME} \
+                --conf spark.driver.host=spark-connect-driver.spark-platform.svc.cluster.local \
+                --conf spark.driver.bindAddress=0.0.0.0 \
+                --conf spark.driver.port=7078 \
+                --conf spark.blockManager.port=7079 \
+                --conf spark.connect.grpc.binding.address=0.0.0.0 \
+                --conf spark.connect.grpc.binding.port=15002 \
+                --conf spark.ui.port=4040 \
+                --conf spark.jars=/opt/spark/jars-extra/iceberg-spark-runtime-4.0_2.13-1.10.1.jar,/opt/spark/jars-extra/iceberg-aws-bundle-1.10.1.jar \
+                --conf spark.executor.instances=1 \
+                --conf spark.executor.cores=2 \
+                --conf spark.executor.memory=2g \
+                --conf spark.driver.memory=3g \
+                --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+                --conf spark.sql.defaultCatalog=polaris \
+                --conf spark.sql.catalog.polaris=org.apache.iceberg.spark.SparkCatalog \
+                --conf spark.sql.catalog.polaris.type=rest \
+                --conf spark.sql.catalog.polaris.uri=http://POLARIS-END-POINT:8181/api/catalog \
+                --conf spark.sql.catalog.polaris.warehouse=${POLARIS_WAREHOUSE} \
+                --conf spark.sql.catalog.polaris.credential=${POLARIS_CLIENT_ID}:${POLARIS_CLIENT_SECRET} \
+                --conf spark.sql.catalog.polaris.scope=PRINCIPAL_ROLE:ALL \
+                --conf spark.sql.catalog.polaris.oauth2-server-uri=http://POLARIS-END-POINT:8181/api/catalog/v1/oauth/tokens \
+                --conf spark.sql.catalog.polaris.io-impl=org.apache.iceberg.aws.s3.S3FileIO \
+                --conf spark.sql.catalog.polaris.s3.endpoint=http://MINIO-END-POINT:9000 \
+                --conf spark.sql.catalog.polaris.s3.path-style-access=true \
+                --conf spark.sql.catalog.polaris.s3.access-key-id=${MINIO_ACCESS_KEY} \
+                --conf spark.sql.catalog.polaris.s3.secret-access-key=${MINIO_SECRET_KEY} \
+                --conf spark.sql.catalog.polaris.s3.region=us-east-1 \
+                --conf spark.eventLog.enabled=false
+
+              tail -f /opt/spark/logs/*
+          resources:
+            requests:
+              cpu: "1"
+              memory: "3Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spark-ui
+  namespace: spark-platform
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: sparkui.homelab.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: spark-connect
+            port:
+              number: 4040
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spark-connect-grpc
+  namespace: spark-platform
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: sparkconnect.homelab.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: spark-connect
+            port:
+              number: 15002
