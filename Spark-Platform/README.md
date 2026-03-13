@@ -43,8 +43,10 @@ Ensure the following infrastructure already exists:
 
 ## Repository Structure
 
-. ├── README.md ├── deploy.sh ├── spark-connect-deployment.yaml └──
-sample-pyspark-batch-job.py
+├── README.md
+├── deploy.sh
+├── spark-connect-deployment.yaml
+└── sample-pyspark-batch-job.py
 
 ------------------------------------------------------------------------
 
